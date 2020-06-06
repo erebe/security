@@ -15,13 +15,14 @@
 
 package com.amazon.dlic.auth.http.jwt;
 
-import io.jsonwebtoken.Claims;
-import io.jsonwebtoken.JwtParser;
-import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.*;
 import io.jsonwebtoken.io.Decoders;
 import io.jsonwebtoken.security.Keys;
 import io.jsonwebtoken.security.WeakKeyException;
 
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.AccessController;
 import java.security.Key;
@@ -29,11 +30,15 @@ import java.security.KeyFactory;
 import java.security.NoSuchAlgorithmException;
 import java.security.PrivilegedAction;
 import java.security.PublicKey;
+import java.security.interfaces.RSAPublicKey;
 import java.security.spec.InvalidKeySpecException;
 import java.security.spec.X509EncodedKeySpec;
-import java.util.Collection;
+import java.util.*;
 import java.util.Map.Entry;
+import java.util.stream.Stream;
 
+import org.apache.cxf.rs.security.jose.jwk.JsonWebKey;
+import org.apache.cxf.rs.security.jose.jwk.JwkUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.elasticsearch.ElasticsearchSecurityException;
@@ -52,53 +57,28 @@ public class HTTPJwtAuthenticator implements HTTPAuthenticator {
 
     protected final Logger log = LogManager.getLogger(this.getClass());
 
+    private static final String JWK_PREFIX = ".jwk.json";
     private static final String BEARER = "bearer ";
     private final JwtParser jwtParser;
     private final String jwtHeaderName;
     private final String jwtUrlParameter;
     private final String rolesKey;
     private final String subjectKey;
+    private final Map<String, RSAPublicKey> jwkMap = new HashMap<>();
 
     public HTTPJwtAuthenticator(final Settings settings, final Path configPath) {
         super();
 
-        JwtParser _jwtParser = null;
-
-        try {
-            String signingKey = settings.get("signing_key");
-
-            if(signingKey == null || signingKey.length() == 0) {
-                log.error("signingKey must not be null or empty. JWT authentication will not work");
-            } else {
-
-                signingKey = signingKey.replace("-----BEGIN PUBLIC KEY-----\n", "");
-                signingKey = signingKey.replace("-----END PUBLIC KEY-----", "");
-
-                byte[] decoded = Decoders.BASE64.decode(signingKey);
-                Key key = null;
-
-                try {
-                    key = getPublicKey(decoded, "RSA");
-                } catch (Exception e) {
-                    log.debug("No public RSA key, try other algos ({})", e.toString());
-                }
-
-                try {
-                    key = getPublicKey(decoded, "EC");
-                } catch (Exception e) {
-                    log.debug("No public ECDSA key, try other algos ({})", e.toString());
-                }
-
-                if(key != null) {
-                    _jwtParser = Jwts.parser().setSigningKey(key);
-                } else {
-                    _jwtParser = Jwts.parser().setSigningKey(decoded);
-                }
-
+        // We use signing_key as path where to find jwk folder :x
+        String signingKeyPath = settings.get("signing_key");
+        JwtParser _jwtParser = Jwts.parser().setSigningKeyResolver(new SigningKeyResolverAdapter() {
+            @Override
+            public Key resolveSigningKey(JwsHeader header, Claims claims) {
+                return jwkMap.computeIfAbsent(header.getKeyId(),
+                        (keyId) -> findJWKKeyforKid(signingKeyPath, header.getKeyId()).orElse(null));
             }
-        } catch (Throwable e) {
-            log.error("Error creating JWT authenticator: "+e+". JWT authentication will not work", e);
-        }
+
+        });
 
         jwtUrlParameter = settings.get("jwt_url_parameter");
         jwtHeaderName = settings.get("jwt_header","Authorization");
@@ -107,6 +87,27 @@ public class HTTPJwtAuthenticator implements HTTPAuthenticator {
         jwtParser = _jwtParser;
     }
 
+    private Optional<RSAPublicKey> findJWKKeyforKid(String JwkFolderPath, String keyId) {
+        try(Stream<Path> path = Files.walk(new File(JwkFolderPath).toPath(), 1)) {
+            return path
+                    .filter((file) -> Files.isRegularFile(file) && file.getFileName().toString().endsWith(JWK_PREFIX))
+                    .map((jwk) -> {
+                        JsonWebKey key = null;
+                        try {
+                            key = JwkUtils.readJwkSet(jwk.toUri()).getKey(keyId);
+                        } catch (IOException e) {
+                            log.debug("Error during parsing JWK file" + jwk, e);
+                        }
+
+                        return (key == null) ? null : JwkUtils.toRSAPublicKey(key);
+                    })
+                    .filter(Objects::nonNull)
+                    .findFirst();
+        } catch (IOException e) {
+            log.error("Error during walking over JWK files in " + JwkFolderPath, e);
+            return Optional.empty();
+        }
+    }
 
     @Override
     public AuthCredentials extractCredentials(RestRequest request, ThreadContext context) throws ElasticsearchSecurityException {
